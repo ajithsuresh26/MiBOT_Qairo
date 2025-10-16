@@ -1,0 +1,740 @@
+import websocket
+import json
+import time
+import pyttsx3
+import threading
+from enum import Enum
+import queue
+from datetime import datetime
+
+# --- STOP/RESUME CONTROL FLAGS ---
+navigation_stop_event = threading.Event()
+quit_event = threading.Event()
+
+upcoming_map_id = None
+
+def quit_navigation():
+    print("Called: quit_navigation")
+    quit_event.set()
+
+def stop_navigation():
+    print("Called: stop_navigation")
+    navigation_stop_event.set()
+
+def resume_navigation():
+    print("Called: resume_navigation")
+    navigation_stop_event.clear()
+
+# Navigation status codes
+NAVI_CODES = {
+    6100: "NAVI_RUNNING - Navigation in operation",
+    2007: "NAVI_RUNNING - In navigation",
+    2006: "NAVI_IDLE - Navigation completed",
+    3001: "OBSTACLE_DETECTED - Obstacle in path",
+    3002: "OBSTACLE_CLEARED - Path clear",
+    4001: "EMERGENCY_STOP - Emergency stop activated",
+    6001: "NAVIGATION_CANCELLED - Navigation was cancelled",
+    1001: "NAVIGATION_SUCCESS - Navigation started successfully",
+    6101: "NAVIGATION_ALREADY_RUNNING - Navigation already running"
+}
+
+# Charging status codes
+CHARGING_CODES = {
+    0: "NAVI_TO_CHARGE_OK - Navigate to charging pile",
+    14002: "NAVI_TO_DOCK_START - Start navigating to charging pile",
+    14004: "NAVI_TO_CHARGE - Start charging through charging pile",
+    14005: "NAVI_TO_DOCK - Navigating to charging pile",
+    6016: "NAVI_NOPILEDETECTED - No charging pile detected"
+}
+
+class ObstacleStatus(Enum):
+    CLEAR = "clear"
+    DETECTED = "detected"
+    AVOIDING = "avoiding"
+
+class TTSManager:
+    def __init__(self):  # <-- fix here
+        self.engine = pyttsx3.init()
+        self.queue = queue.Queue()
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def speak(self, text):
+        self.queue.put(text)
+
+    def _run(self):
+        while True:
+            text = self.queue.get()
+            try:
+                self.engine.say(text)
+                self.engine.runAndWait()
+            except Exception as e:
+                print(f"TTS error: {e}")
+
+class ObstacleAvoidance:
+    def __init__(self, tts_manager):  # <-- fix here
+        self.status = ObstacleStatus.CLEAR
+        self.tts = tts_manager
+        self.obstacle_timeout = 30
+        
+    def handle_obstacle(self, ws):
+        if self.status == ObstacleStatus.CLEAR:
+            self.status = ObstacleStatus.DETECTED
+            self.tts.speak("Obstacle detected. Attempting to avoid.")
+            return self._attempt_obstacle_avoidance(ws)
+        return False
+    
+    def _attempt_obstacle_avoidance(self, ws):
+        self.status = ObstacleStatus.AVOIDING
+        strategies = [
+            self._wait_for_clearance,
+            self._try_alternative_path,
+            self._slow_navigation
+        ]
+        for strategy in strategies:
+            if strategy(ws):
+                self.status = ObstacleStatus.CLEAR
+                self.tts.speak("Obstacle cleared. Resuming navigation.")
+                return True
+        self.tts.speak("Unable to avoid obstacle. Manual intervention required.")
+        return False
+    
+    def _wait_for_clearance(self, ws):
+        start_time = time.time()
+        while time.time() - start_time < self.obstacle_timeout:
+            send(ws, {"cmd": "request_check_path"})
+            res = receive_response(ws, timeout=2)
+            if res and res.get("code") == 3002:
+                return True
+            time.sleep(2)
+        return False
+    
+    def _try_alternative_path(self, ws):
+        send(ws, {"cmd": "request_alternative_path"})
+        time.sleep(3)
+        return True
+    
+    def _slow_navigation(self, ws):
+        return True
+
+# Initialize TTS and Obstacle Avoidance
+tts_manager = TTSManager()
+obstacle_avoidance = ObstacleAvoidance(tts_manager)
+
+def log_message(msg):
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{timestamp}] {msg}")
+
+def send(ws, msg):
+    print(f"Called: send | msg: {msg}")
+    ws.send(json.dumps(msg))
+
+def receive_response(ws, timeout=5):
+    print(f"Called: receive_response | timeout: {timeout}")
+    ws.settimeout(timeout)
+    try:
+        return json.loads(ws.recv())
+    except:
+        return None
+
+def get_battery_status(ws):
+    print("Called: get_battery_status")
+    send(ws, {"cmd": "request_battery_info"})
+    start_time = time.time()
+    
+    while time.time() - start_time < 10:
+        res = receive_response(ws, timeout=2)
+        if res:
+            cmd = res.get("cmd")
+            if cmd == "notify_battery_info":
+                data = res.get("data", {})
+                battery_level = data.get("battery", 0)
+                charging_status = data.get("status", 0)
+                
+                return {
+                    "battery_level": battery_level,
+                    "charging_status": charging_status,
+                    "needs_charging": battery_level < 70
+                }
+        time.sleep(0.5)
+    
+    return {"battery_level": 100, "charging_status": 0, "needs_charging": False}
+
+def dock_charge(ws, map_id, x, y, theta, max_attempts=3):
+    print(f"Called: dock_charge | map_id: {map_id}, x: {x}, y: {y}, theta: {theta}")
+    for attempt in range(max_attempts):
+        send(ws, {
+            "cmd": "request_dock_charge",
+            "data": {"mapId": map_id, "x": x, "y": y, "theta": theta}
+        })
+        
+        start_time = time.time()
+        timeout = 120
+        charging_started = False
+        docking_successful = False
+        
+        while time.time() - start_time < timeout:
+            res = receive_response(ws, timeout=2)
+            
+            if res:
+                cmd = res.get("cmd")
+                code = res.get("code")
+                
+                if cmd == "response_dock_ctrl":
+                    if code == 0:
+                        docking_successful = True
+                        break
+                    elif code == 6016:
+                        break
+                
+                elif cmd == "notify_heart_beat":
+                    msg = res.get("msg", "")
+                    if "navigation goal out costmap" in msg:
+                        break
+            
+            time.sleep(1)
+        
+        if docking_successful:
+            time.sleep(5)
+            charging_confirmed = False
+            for check_attempt in range(3):
+                battery_info = get_battery_status(ws)
+                if battery_info["charging_status"] in [1, 2]:
+                    charging_confirmed = True
+                    charging_started = True
+                    break
+                else:
+                    time.sleep(5)
+            
+            if charging_confirmed:
+                break
+            else:
+                if attempt < max_attempts - 1:
+                    send(ws, {"cmd": "request_dock_charge_off"})
+                    time.sleep(5)
+                    continue
+        
+        if attempt < max_attempts - 1:
+            time.sleep(5)
+            continue
+        else:
+            return False
+    
+    if not charging_started:
+        return False
+    
+    # Monitor charging process
+    charging_complete = False
+    start_time = time.time()
+    last_battery_check = time.time()
+    
+    while time.time() - start_time < 3600:  # 1 hour max
+        if time.time() - last_battery_check >= 30:
+            battery_info = get_battery_status(ws)
+            last_battery_check = time.time()
+            
+            if battery_info["battery_level"] >= 70:
+                charging_complete = True
+                break
+            elif battery_info["charging_status"] == 0:
+                return False
+        
+        time.sleep(5)
+    
+    return True
+
+def set_map(ws, map_name, map_id):
+    print(f"Called: set_map | map_name: {map_name}, map_id: {map_id}")
+
+    send(ws, {"cmd": "request_set_map", "data": {"mapId": map_id}})
+    while True:
+        res = receive_response(ws)
+        if res and res.get("cmd") == "response_set_map" and res.get("code") == 1000:
+            break
+
+def get_points(ws, map_id):
+    print(f"Called: get_points | map_id: {map_id}")
+
+    send(ws, {"cmd": "request_point_list", "data": {"mapId": map_id}})
+    start = time.time()
+    while time.time() - start < 5:
+        res = receive_response(ws, timeout=1)
+        if res and res.get("cmd") == "response_point_list" and res.get("code") == 0:
+            return res.get("data", {}).get("points", [])
+    return []
+
+def reset_map(ws):
+    print("Called: reset_map")
+
+    send(ws, {"cmd": "request_reset_map"})
+    time.sleep(2)
+
+def relocate(ws, x, y, theta, mode=2):
+    print(f"Called: relocate | x: {x}, y: {y}, theta: {theta}, mode: {mode}")
+
+    send(ws, {"cmd": "request_force_relocate", "data": {"x": x, "y": y, "theta": theta, "mode": mode}})
+    while True:
+        res = receive_response(ws)
+        if res and res.get("cmd") == "response_relocate_position" and res.get("code") == 4000:
+            break
+
+def relocate_with_retry(ws, x, y, theta, retries=3):
+    print(f"Called: relocate_with_retry | x: {x}, y: {y}, theta: {theta}, retries: {retries}")
+
+    for attempt in range(retries):
+        reset_map(ws)
+        relocate(ws, x, y, theta)
+        time.sleep(2)
+        return True
+    return False
+
+def cancel_current_navigation(ws):
+    print("Called: cancel_current_navigation")
+
+    send(ws, {"cmd": "request_stop_navigation"})
+    time.sleep(1)
+    try:
+        while True:
+            res = receive_response(ws, timeout=0.1)
+            if not res:
+                break
+    except:
+        pass
+
+def ensure_robot_ready_for_navigation(ws):
+    print("Called: ensure_robot_ready_for_navigation")
+
+    cancel_current_navigation(ws)
+    time.sleep(1)
+    
+    send(ws, {"cmd": "request_robot_status"})
+    res = receive_response(ws, timeout=3)
+    
+    max_wait = 10
+    wait_time = 0
+    while wait_time < max_wait:
+        send(ws, {"cmd": "request_robot_status"})
+        res = receive_response(ws, timeout=1)
+        if res and res.get("code") in [2006, 0]:
+            return True
+        time.sleep(1)
+        wait_time += 1
+    
+    return True
+
+def start_navigation_and_wait_completion(ws, x, y, theta, speed=0.5, navigation_control=None):
+    print(f"Called: start_navigation_and_wait_completion | x: {x}, y: {y}, theta: {theta}, speed: {speed}")
+
+    ensure_robot_ready_for_navigation(ws)
+    
+    send(ws, {"cmd": "request_start_navigation", "data": {"x": x, "y": y, "theta": theta, "speed": speed}})
+
+    start_time = time.time()
+    timeout = 180
+    navigation_started = False
+    navigation_completed = False
+    is_paused = False
+    pause_count = 0
+
+    while True:
+        if quit_event.is_set():
+            print("🚪 Quit event detected. Stopping navigation and closing connection.")
+            send(ws, {"cmd": "request_stop_navigation"})
+            try:
+                ws.close()
+            except Exception:
+                pass
+            return {"success": False, "message": "Quit event detected."}
+
+
+        if navigation_control and navigation_control.get('force_stop') and navigation_control['force_stop'].is_set():
+            send(ws, {"cmd": "request_stop_navigation"})
+            print("🛑 Force stop navigation requested.")
+            return {"success": False, "message": "Force stop detected."}
+        
+        if navigation_stop_event.is_set():
+            send(ws, {"cmd": "request_stop_navigation"})
+            print("🛑 Navigation stop event detected. Stopping navigation.")
+            return {"success": False, "message": "Navigation stop event set."}
+        
+        if navigation_control and navigation_control.get('paused') and navigation_control['paused'].is_set():
+            if not is_paused:
+                send(ws, {"cmd": "request_stop_navigation"})
+                print("🛑⏸️ Navigation paused.")
+                is_paused = True
+                pause_count += 1
+                time.sleep(1)
+                try:
+                    while True:
+                        res = receive_response(ws, timeout=0.1)
+                        if not res:
+                            break
+                except:
+                    pass
+            
+            while navigation_control['paused'].is_set():
+                time.sleep(0.2)
+            
+            if is_paused:
+                if pause_count > 1:
+                    ensure_robot_ready_for_navigation(ws)
+                    time.sleep(2)
+                else:
+                    time.sleep(1)
+                
+                send(ws, {"cmd": "request_start_navigation", "data": {"x": x, "y": y, "theta": theta, "speed": speed}})
+                print("✅▶️ Resuming navigation after pause.")
+                start_time = time.time()
+                navigation_started = False
+                navigation_completed = False
+                is_paused = False
+                time.sleep(0.5)
+            
+        res = receive_response(ws, timeout=1)
+
+        if res:
+            cmd = res.get("cmd")
+            code = res.get("code")
+
+            if cmd == "response_start_navigation":
+                if code == 1001 or res.get('msg') == 'navigation success':
+                    print("✅ Navigation started successfully.")
+                    navigation_started = True
+                    navigation_completed = False
+                elif code == 6001:
+                    time.sleep(1)
+                    ensure_robot_ready_for_navigation(ws)
+                    send(ws, {"cmd": "request_start_navigation", "data": {"x": x, "y": y, "theta": theta, "speed": speed}})
+                    print("🔄 Navigation cancelled, retrying...")
+                    start_time = time.time()
+                    continue
+                elif code == 6101:
+                    ensure_robot_ready_for_navigation(ws)
+                    time.sleep(2)
+                    send(ws, {"cmd": "request_start_navigation", "data": {"x": x, "y": y, "theta": theta, "speed": speed}})
+                    start_time = time.time()
+                    continue
+                else:
+                    if code == 6101:
+                        ensure_robot_ready_for_navigation(ws)
+                        time.sleep(2)
+                        send(ws, {"cmd": "request_start_navigation", "data": {"x": x, "y": y, "theta": theta, "speed": speed}})
+                        start_time = time.time()
+                        continue
+                    else:
+                        return False
+
+            elif cmd == "notify_heart_beat":
+                if code == 6100:
+                    navigation_completed = False
+                elif code == 2007:
+                    navigation_completed = False
+                elif code == 2006:
+                    if navigation_started and not navigation_completed:
+                        navigation_completed = True
+                        time.sleep(1)
+                        return True
+                elif code == 3001:
+                    if not obstacle_avoidance.handle_obstacle(ws):
+                        return False
+                elif code == 4001:
+                    return False
+
+        if time.time() - start_time > timeout:
+            return False
+
+        time.sleep(0.1)
+
+def execute_charging_phase(ws, charge_map_id, charge_anchor, charge_pile):
+    print("Called: execute_charging_phase")
+
+    log_message("Starting charging phase")
+    
+    set_map(ws, "charge_station", charge_map_id)
+    
+    if not relocate_with_retry(ws, charge_anchor["x"], charge_anchor["y"], charge_anchor["theta"]):
+        return False
+    
+    charging_success = dock_charge(ws, charge_map_id, charge_pile["x"], charge_pile["y"], charge_pile["theta"])
+    
+    return charging_success
+
+def check_battery_and_charge_if_needed(ws, charge_map_id, charge_anchor, charge_pile, threshold=70):
+    print(f"Called: check_battery_and_charge_if_needed | threshold: {threshold}")
+
+    battery_info = get_battery_status(ws)
+    
+    if battery_info["battery_level"] < threshold:
+        log_message(f"Battery level ({battery_info['battery_level']}%) below threshold. Charging required.")
+        return execute_charging_phase(ws, charge_map_id, charge_anchor, charge_pile)
+    else:
+        log_message(f"Battery level ({battery_info['battery_level']}%) sufficient.")
+        return True
+
+def execute_map_navigation(ws, map_name, map_id, navigation_control=None, reverse_mode=False):
+    print(f"Called: execute_map_navigation | map_name: {map_name}, map_id: {map_id}, reverse_mode: {reverse_mode}")
+
+    if navigation_control and navigation_control.get('force_stop') and navigation_control['force_stop'].is_set():
+        return False
+
+    if navigation_stop_event.is_set():
+        return False
+
+    cancel_current_navigation(ws)
+    set_map(ws, map_name, map_id)
+    points = get_points(ws, map_id)
+    if not points:
+        return False
+
+    anchor = next((p for p in points if p.get("type") == "anchor_point"), None)
+    dest = next((p for p in points if p.get("type") == "destination"), None)
+
+    if not anchor or not dest:
+        return False
+
+    # Swap anchor and dest if reverse_mode
+    start_point, end_point = (dest, anchor) if reverse_mode else (anchor, dest)
+
+    if not relocate_with_retry(ws, start_point["x"], start_point["y"], start_point["theta"]):
+        return False
+
+    time.sleep(2)
+    success = start_navigation_and_wait_completion(ws, end_point["x"], end_point["y"], end_point["theta"], navigation_control=navigation_control)
+    return success
+
+def run_multi_map_navigation_with_charging(robot_ip, map_ids, charge_map_id, port, navigation_status=None, navigation_control=None):
+    print("Called: run_multi_map_navigation_with_charging")
+
+    try:
+        ws = websocket.create_connection(f"ws://{robot_ip}:{port}")
+        print(f"✅✅Connected to robot at {robot_ip}:{port}")
+        
+        # Get charge station points
+        set_map(ws, "charge_station", charge_map_id)
+        charge_points = get_points(ws, charge_map_id)
+        if not charge_points:
+            return {"success": False, "message": "No charge station points found"}
+        
+        charge_anchor = next((p for p in charge_points if p.get("type") == "anchor_point"), None)
+        charge_pile = next((p for p in charge_points if p.get("type") == "charge"), None)
+        
+        if not charge_anchor or not charge_pile:
+            return {"success": False, "message": "Missing charge station waypoints"}
+        
+        # Check initial battery and charge if needed
+        if not check_battery_and_charge_if_needed(ws, charge_map_id, charge_anchor, charge_pile, threshold=70):
+            log_message("Initial charging failed, continuing anyway...")
+        
+        successful_maps = []
+        failed_maps = []
+        print(f"Starting navigation for maps: {map_ids}")
+        for idx, map_id in enumerate(map_ids):
+            print(f"===============🚪✅➡ Navigating on map {idx+1}==================")
+            if navigation_status is not None:
+                navigation_status['current_map'] = map_id
+            
+            if navigation_control and navigation_control.get('force_stop') and navigation_control['force_stop'].is_set():
+                break
+            
+            if navigation_stop_event.is_set():
+                break
+            
+            while navigation_control and navigation_control.get('paused') and navigation_control['paused'].is_set():
+                print("⏸🛑🚪 Navigation paused...")
+                if navigation_status is not None:
+                    navigation_status['paused'] = True
+                time.sleep(0.5)
+            
+            if navigation_status is not None:
+                navigation_status['paused'] = False
+                print("▶️🚪 Resuming navigation...")
+            
+            map_name = f"map{idx+1}"
+            success = execute_map_navigation(ws, map_name, map_id, navigation_control=navigation_control, reverse_mode=False)
+            if success:
+                 successful_maps.append(map_name)
+            else:
+                 failed_maps.append(map_name)
+            
+            reverse_success = execute_map_navigation(ws, map_name, map_id, navigation_control=navigation_control, reverse_mode=True)
+            
+            if reverse_success:
+                successful_maps.append(map_name + "_reverse")
+            else:
+                failed_maps.append(map_name + "_reverse")
+            
+            # Check battery after each map
+            if not check_battery_and_charge_if_needed(ws, charge_map_id, charge_anchor, charge_pile, threshold=30):
+                log_message("Mid-mission charging failed, continuing anyway...")
+            
+            if idx != len(map_ids) - 1:
+                time.sleep(3)
+        
+        # Final battery check   
+        if not check_battery_and_charge_if_needed(ws, charge_map_id, charge_anchor, charge_pile, threshold=70):
+            log_message("Final charging failed, continuing anyway...")
+                
+        ws.close()
+        
+        if len(successful_maps) == len(map_ids):
+            return {"success": True}
+        else:
+            return {"success": False, "message": f"{len(failed_maps)} maps failed"}
+            
+    except Exception as e:
+        return {"success": False, "message": str(e)}
+
+upcoming_map_ids = [None, None]
+upcoming_map_names = [None, None]
+
+def run_multi_map_navigation_no_tts(robot_ip, map_ids, port, navigation_status=None, navigation_control=None):
+    """Navigate all maps forward, then reverse (destination to anchor) with print statements and emojis."""
+    try:
+        print("🚀 Starting multi-map navigation (forward)...")
+        ws = websocket.create_connection(f"ws://{robot_ip}:{port}")
+        successful_maps = []
+        failed_maps = []
+        # Forward navigation: anchor -> destination
+        global upcoming_map_ids, upcoming_map_names
+        for idx, map_id in enumerate(map_ids):
+
+            upcoming_map_ids = [
+                map_ids[idx + 1] if idx + 1 < len(map_ids) else None,
+                map_ids[idx + 2] if idx + 2 < len(map_ids) else None
+            ]
+            print(f"➡ Navigating FORWARD on map {idx+1} (ID: {map_id})...")
+            if navigation_status is not None:
+                navigation_status['current_map'] = map_id
+
+            if navigation_control and navigation_control.get('force_stop') and navigation_control['force_stop'].is_set():
+                print("🛑 Force stop detected. Exiting navigation loop.")
+                break
+
+            if navigation_stop_event.is_set():
+                print("🛑 Navigation stop event set. Exiting navigation loop.")
+                break
+
+            if quit_event.is_set():
+                print("🚪 Quit event detected. Stopping navigation and closing connection.")
+                send(ws, {"cmd": "request_stop_navigation"})
+                try:
+                    ws.close()
+                except Exception:
+                    pass
+                return {"success": False, "message": "Quit event detected."}
+
+            
+            while navigation_control and navigation_control.get('paused') and navigation_control['paused'].is_set():
+                print("⏸ Navigation paused...")
+                if navigation_status is not None:
+                    navigation_status['paused'] = True
+                time.sleep(0.5)
+
+            if navigation_status is not None:
+                navigation_status['paused'] = False
+
+            map_name = f"map{idx+1}"
+            success = execute_map_navigation(ws, map_name, map_id, navigation_control=navigation_control, reverse_mode=False)
+            if success:
+                print(f"✅ Map {map_name} navigation completed!")
+                successful_maps.append(map_name)
+            else:
+                print(f"❌ Map {map_name} navigation failed!")
+                failed_maps.append(map_name)
+
+            if idx != len(map_ids) - 1:
+                print("⏳ Waiting before next map...")
+                time.sleep(3)
+
+        # Reverse navigation: destination -> anchor
+        print("🔄 Starting REVERSE navigation for all maps...")
+        for idx, map_id in enumerate(reversed(map_ids)):
+            print(f"⬅ Navigating REVERSE on map {len(map_ids)-idx} (ID: {map_id})...")
+            map_name = f"map{len(map_ids)-idx}_reverse"
+            success = execute_map_navigation(ws, f"map{len(map_ids)-idx}", map_id, navigation_control=navigation_control, reverse_mode=True)
+            if success:
+                print(f"✅ {map_name} reverse navigation completed!")
+                successful_maps.append(map_name)
+            else:
+                print(f"❌ {map_name} reverse navigation failed!")
+                failed_maps.append(map_name)
+
+            if idx != len(map_ids) - 1:
+                print("⏳ Waiting before next reverse map...")
+                time.sleep(3)
+
+        ws.close()
+
+        if len(failed_maps) == 0:
+            print("🎉 All maps (forward and reverse) navigated successfully!")
+            return {"success": True}
+        else:
+            print(f"⚠ {len(failed_maps)} maps failed: {failed_maps}")
+            return {"success": False, "message": f"{len(failed_maps)} maps failed: {failed_maps}"}
+
+    except Exception as e:
+        print(f"❌ Exception during navigation: {e}")
+        return {"success": False, "message": str(e)}
+
+def main():
+    ROBOT_IP = "192.168.1.100"
+    WS_PORT = 8080
+    MAP_IDS = [1, 2, 3, 4, 5]
+    CHARGE_MAP_ID = "charge_station_id"
+    
+    try:
+        ws = websocket.create_connection(f"ws://{ROBOT_IP}:{WS_PORT}")
+        
+        # Get charge station points
+        set_map(ws, "charge_station", CHARGE_MAP_ID)
+        charge_points = get_points(ws, CHARGE_MAP_ID)
+        
+        if charge_points:
+            charge_anchor = next((p for p in charge_points if p.get("type") == "anchor_point"), None)
+            charge_pile = next((p for p in charge_points if p.get("type") == "charge"), None)
+            
+            if charge_anchor and charge_pile:
+                # Check initial battery and charge if needed
+                check_battery_and_charge_if_needed(ws, CHARGE_MAP_ID, charge_anchor, charge_pile)
+        
+        successful_maps = []
+        failed_maps = []
+        
+        for idx, map_id in enumerate(MAP_IDS):
+            if navigation_stop_event.is_set():
+                break
+                
+            map_name = f"map{idx+1}"
+            
+            success = execute_map_navigation(ws, map_name, map_id)
+            
+            if success:
+                successful_maps.append(map_name)
+            else:
+                failed_maps.append(map_name)
+            
+            # Check battery after each map if charge station is available
+            if charge_points and charge_anchor and charge_pile:
+                check_battery_and_charge_if_needed(ws, CHARGE_MAP_ID, charge_anchor, charge_pile, threshold=30)
+                
+            if idx != len(MAP_IDS) - 1:
+                time.sleep(3)
+        
+        # Final battery check
+        if charge_points and charge_anchor and charge_pile:
+            check_battery_and_charge_if_needed(ws, CHARGE_MAP_ID, charge_anchor, charge_pile)
+                
+        if len(successful_maps) == len(MAP_IDS):
+            log_message("All map navigations completed successfully!")
+        else:
+            log_message(f"{len(failed_maps)} out of {len(MAP_IDS)} maps failed")
+            
+        ws.close()
+        
+    except Exception as e:
+        log_message(f"Error occurred: {e}")
+        if 'ws' in locals():
+            ws.close()
+
+if __name__ == "__main__":
+    main()
